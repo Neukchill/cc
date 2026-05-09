@@ -56,7 +56,7 @@ DNAT 改的是目的地址，源地址仍是原始客户端。如果不做 SNAT�
 ### 1) Hub（中转机，例如 AWS EC2 ap3）
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<你的用户名>/<仓库名>/main/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/Neukchill/cc/main/install.sh -o install.sh
 sudo bash install.sh install
 # 选 1 (hub)，按提示用默认值即可
 ```
