@@ -68,7 +68,7 @@ sudo bash install.sh install
 ### 2) Node（每台落地机，比如 Lax / Japan）
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<你的用户名>/<仓库名>/main/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/Neukchill/cc/main/install.sh -o install.sh
 sudo bash install.sh install
 # 选 2 (node)
 # 输入：Hub 公网IP / Hub 端口 / Hub 公钥 / 本机序号 (Lax=2, Japan=3, HK=4...)
