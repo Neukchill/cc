@@ -452,7 +452,7 @@ show_menu() {
                 NODE_NAME="$n"
                 add_node; pause ;;
             4) wg_reload; pause ;;
-            5) wg-quick down wg0 2>/dev/null && log_ok "已停止" || log_warn "停止失败"; pause ;;
+            5) (wg-quick down wg0 2>/dev/null && log_ok "已停止") || log_warn "停止失败"; pause ;;
             6) wg_reload; pause ;;
             7) echo; wg show wg0 2>/dev/null || log_warn "获取失败"; echo; pause ;;
             8) optimize_system; pause ;;
@@ -533,7 +533,7 @@ main() {
         init-node) init_node; exit 0 ;;
         add-node) add_node; exit 0 ;;
         start) wg_reload; exit 0 ;;
-        stop) wg-quick down wg0 2>/dev/null && log_ok "已停止"; exit 0 ;;
+        stop) wg-quick down wg0 2>/dev/null && log_ok "已停止" || log_warn "停止失败或未运行"; exit 0 ;;
         restart) wg_reload; exit 0 ;;
         optimize) optimize_system; exit 0 ;;
         save-iptables) save_iptables_rules; exit 0 ;;
