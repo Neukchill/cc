@@ -521,7 +521,6 @@ EOF
 }
 
 parse_args() {
-    local pos=()
     while [ $# -gt 0 ]; do
         case "$1" in
             init-hub|init-node|add-node|start|stop|restart|status|optimize|save-iptables|help)
@@ -534,7 +533,7 @@ parse_args() {
             --ext-port) EXTERNAL_PORT="$2"; shift 2 ;;
             --psk) WG_PEER_PSK="$2"; shift 2 ;;
             --help|-h) ACTION="help"; shift ;;
-            *) pos+=("$1"); shift ;;
+            *) shift ;;
         esac
     done
     [ -z "$ACTION" ] && ACTION="interactive"
