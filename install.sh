@@ -864,7 +864,7 @@ parse_args() {
     local positional=()
     while [ $# -gt 0 ]; do
         case "$1" in
-            wg-init-hub|wg-init-node|wg-add-node|wg-update|wg-status|maintain|status|upgrade|uninstall|help)
+            install|wg-init-hub|wg-init-node|wg-add-node|wg-update|wg-status|maintain|status|upgrade|uninstall|help)
                 ACTION="$1"; shift ;;
             --wg-port) WG_LISTEN_PORT="$2"; shift 2 ;;
             --wg-endpoint) WG_ENDPOINT="$2"; shift 2 ;;
@@ -929,6 +929,11 @@ main() {
         wg-init-node) cmd_wg_init_node ;;
         wg-add-node) cmd_wg_add_node ;;
         maintain) cmd_maintain ;;
+        install) 
+            log_info "此脚本主要用于 WireGuard 隧道管理"
+            log_info "直接运行进入交互菜单: sudo bash install.sh"
+            log_info "Xboard-Node 安装请使用原版 install.sh"
+            ;;
         upgrade) log_info "升级功能请参考原版 install.sh"; ;;
         uninstall) log_info "卸载功能请参考原版 install.sh"; ;;
         *)
