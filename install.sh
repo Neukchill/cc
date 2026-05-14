@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-set -Eeuo pipefail
+set -Eeo pipefail
+
+# 错误处理
+trap 'echo -e "\033[0;31m[错误] 脚本在第 $LINENO 行出错 (退出码=$?)\033[0m"' ERR
 
 # ============================================
 # WireGuard 中继管理脚本 - 完整版 v3
@@ -45,7 +48,12 @@ clear_screen() { clear 2>/dev/null || true; }
 check_root() { [ "$(id -u)" -ne 0 ] && log_error "需要 root 权限" && exit 1; }
 
 detect_os() {
-    if [ -f /etc/os-release ]; then . /etc/os-release; echo "$ID"; else echo "unknown"; fi
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release 2>/dev/null || true
+        echo "${ID:-unknown}"
+    else
+        echo "unknown"
+    fi
 }
 
 # ============================================
@@ -120,9 +128,17 @@ setup_rps() {
     
     if [ ! -f "$RPS_SERVICE" ]; then
         cat > "$RPS_SERVICE" <<EOF
-[Unit] Description=RPS After=network.target
-[Service] Type=oneshot ExecStart=/bin/bash -c 'for i in $ifaces; do for f in /sys/class/net/\$i/queues/rx-*/rps_cpus; do echo $mask > \$f 2>/dev/null || true; done; done' RemainAfterExit=yes
-[Install] WantedBy=multi-user.target
+[Unit]
+Description=RPS
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'for i in $ifaces; do for f in /sys/class/net/\$i/queues/rx-*/rps_cpus; do echo $mask > \$f 2>/dev/null || true; done; done'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
 EOF
         systemctl daemon-reload >/dev/null 2>&1 || true
         systemctl enable rps-affinity.service >/dev/null 2>&1 || true
@@ -360,24 +376,24 @@ show_status() {
         [ "$role" = "hub" ] && echo -e "  角色: ${CYAN}Hub (中转)${NC}" || echo -e "  角色: ${CYAN}Node (落地)${NC}"
         
         if [ -f "$WG_CONFIG_FILE" ]; then
-            local port=$(grep '^ListenPort' "$WG_CONFIG_FILE" 2>/dev/null | awk '{print $3}') || port="无"
-            local ip=$(grep '^Address' "$WG_CONFIG_FILE" 2>/dev/null | head -1 | awk '{print $3}') || ip="无"
-            local peers=$(grep -c '^\[Peer\]' "$WG_CONFIG_FILE" 2>/dev/null) || peers=0
+            local port=$(grep '^ListenPort' "$WG_CONFIG_FILE" 2>/dev/null | awk '{print $3}')
+            local ip=$(grep '^Address' "$WG_CONFIG_FILE" 2>/dev/null | head -1 | awk '{print $3}')
+            local peers=$(grep -c '^\[Peer\]' "$WG_CONFIG_FILE" 2>/dev/null || echo 0)
             
-            echo -e "  端口: ${port}  IP: ${ip}  Peers: ${peers}"
+            echo -e "  端口: ${port:-无}  IP: ${ip:-无}  Peers: ${peers}"
             
             # 公钥
-            local priv=$(grep '^PrivateKey' "$WG_CONFIG_FILE" 2>/dev/null | head -1 | awk '{print $3}') || priv=""
+            local priv=$(grep '^PrivateKey' "$WG_CONFIG_FILE" 2>/dev/null | head -1 | awk '{print $3}')
             [ -n "$priv" ] && command -v wg >/dev/null 2>&1 && echo -e "  公钥: ${BOLD}$(echo "$priv" | wg pubkey 2>/dev/null)${NC}"
             
             # 运行状态
             if command -v wg >/dev/null 2>&1 && wg show wg0 >/dev/null 2>&1; then
                 echo -e "  状态: ${GREEN}运行中${NC}"
-                local hs=$(wg show wg0 latest-handshakes 2>/dev/null | awk '{print $2}' | sort -rn | head -1) || hs=""
-                [ -n "$hs" ] && [ "$hs" -gt 0 ] 2>/dev/null && {
+                local hs=$(wg show wg0 latest-handshakes 2>/dev/null | awk '{print $2}' | sort -rn | head -1)
+                if [ -n "$hs" ] && [ "$hs" -gt 0 ] 2>/dev/null; then
                     local ago=$(( $(date +%s) - hs ))
                     [ "$ago" -lt 180 ] && echo -e "  握手: ${GREEN}${ago}秒前${NC}" || echo -e "  握手: ${RED}${ago}秒前${NC}"
-                }
+                fi
             else
                 echo -e "  状态: ${RED}未运行${NC}"
             fi
