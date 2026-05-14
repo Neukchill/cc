@@ -130,7 +130,7 @@ EOF
     fi
     
     for i in $ifaces; do
-        for f in /sys/class/net/$i/queues/rx-*/rps_cpus 2>/dev/null; do
+        for f in /sys/class/net/$i/queues/rx-*/rps_cpus; do
             [ -f "$f" ] && echo "$mask" > "$f" 2>/dev/null || true
         done
     done
