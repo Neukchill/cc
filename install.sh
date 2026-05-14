@@ -359,7 +359,35 @@ detect_current_state() {
     fi
 }
 
-check_root() { [ "$(id -u)" -ne 0 ] && log_error "请使用 root 或 sudo 运行" && exit 1; }
+check_root() {
+    # 检查是否是 Windows 环境
+    local uname_s
+    uname_s=$(uname -s 2>/dev/null || echo "Linux")
+    case "$uname_s" in
+        MINGW*|MSYS*|CYGWIN*)
+            echo -e "${RED}[错误]${NC} 此脚本需要在 Linux 服务器上运行，不能在 Windows 直接执行"
+            echo -e "${DIM}请通过 SSH 连接到你的 Linux 服务器，然后运行此脚本${NC}"
+            exit 1
+            ;;
+    esac
+    if [ "$(id -u 2>/dev/null)" != "0" ]; then
+        echo -e "${RED}[错误]${NC} 请使用 root 或 sudo 运行"
+        exit 1
+    fi
+}
+
+detect_platform() {
+    local os_name
+    os_name=$(uname -s 2>/dev/null || echo "unknown")
+    case "$os_name" in
+        Linux) return 0 ;;
+        *) 
+            log_error "不支持的平台: $os_name (仅支持 Linux)"
+            exit 1
+            ;;
+    esac
+}
+
 detect_arch() {
     case "$(uname -m)" in
         x86_64|amd64) ARCH="amd64" ;;
@@ -368,7 +396,11 @@ detect_arch() {
     esac
 }
 detect_os() {
-    [ -f /etc/os-release ] && . /etc/os-release && OS="$ID" || OS="unknown"
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release && OS="$ID" || OS="linux"
+    else
+        OS="linux"
+    fi
 }
 ensure_systemd() {
     command -v systemctl >/dev/null 2>&1 || { log_error "需要 systemd"; exit 1; }
@@ -376,21 +408,28 @@ ensure_systemd() {
 }
 install_dependencies() {
     log_step "安装依赖..."
-    case "$OS" in
-        ubuntu|debian)
-            DEBIAN_FRONTEND=noninteractive apt-get update -qq 2>/dev/null
-            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl wget ca-certificates wireguard-tools iptables >/dev/null 2>&1
-            ;;
-        centos|rhel|rocky|almalinux|fedora)
-            if command -v dnf >/dev/null 2>&1; then
-                dnf install -y -q curl wget ca-certificates wireguard-tools iptables >/dev/null 2>&1
-            else
-                yum install -y -q curl wget ca-certificates wireguard-tools iptables >/dev/null 2>&1
-            fi
-            ;;
-        *) log_warn "未知系统 $OS，尝试继续" ;;
-    esac
-    log_ok "依赖安装完成"
+    
+    # 检查系统工具是否存在
+    if command -v apt-get >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive apt-get update -qq 2>/dev/null || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl wget ca-certificates wireguard-tools iptables 2>/dev/null || true
+        log_ok "依赖安装完成"
+        return 0
+    fi
+    
+    if command -v dnf >/dev/null 2>&1; then
+        dnf install -y -q curl wget ca-certificates wireguard-tools iptables 2>/dev/null || true
+        log_ok "依赖安装完成"
+        return 0
+    fi
+    
+    if command -v yum >/dev/null 2>&1; then
+        yum install -y -q curl wget ca-certificates wireguard-tools iptables 2>/dev/null || true
+        log_ok "依赖安装完成"
+        return 0
+    fi
+    
+    log_warn "未找到包管理器，部分功能可能不可用"
 }
 ensure_dirs() { mkdir -p "$INSTALL_ROOT" "$BACKUP_DIR" && chmod 700 "$INSTALL_ROOT"; }
 
