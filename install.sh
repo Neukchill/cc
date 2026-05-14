@@ -157,16 +157,45 @@ show_wg_config_info() {
     fi
 
     if [ -f "$WG_CONFIG_FILE" ]; then
-        local port ip peers
-        port=$(grep '^ListenPort' "$WG_CONFIG_FILE" 2>/dev/null | awk '{print $3}')
-        ip=$(grep '^Address' "$WG_CONFIG_FILE" 2>/dev/null | head -1 | awk '{print $3}')
-        peers=$(grep -c '^\[Peer\]' "$WG_CONFIG_FILE" 2>/dev/null || echo "0")
+        local port ip peers pubkey
+        port=$(grep '^ListenPort' "$WG_CONFIG_FILE" 2>/dev/null | awk '{print $3}') || port=""
+        ip=$(grep '^Address' "$WG_CONFIG_FILE" 2>/dev/null | head -1 | awk '{print $3}') || ip=""
+        peers=$(grep -c '^\[Peer\]' "$WG_CONFIG_FILE" 2>/dev/null) || peers="0"
         echo -e "  监听端口: ${port:-${DIM}无${NC}}"
         echo -e "  隧道IP:   ${ip:-${DIM}无${NC}}"
         echo -e "  Peer数量: ${peers}"
+
+        # 显示本机公钥
+        local privkey
+        privkey=$(grep '^PrivateKey' "$WG_CONFIG_FILE" 2>/dev/null | head -1 | awk '{print $3}') || privkey=""
+        if [ -n "$privkey" ] && command -v wg >/dev/null 2>&1; then
+            pubkey=$(echo "$privkey" | wg pubkey 2>/dev/null) || pubkey=""
+            if [ -n "$pubkey" ]; then
+                echo -e "  本机公钥: ${BOLD}${pubkey}${NC}"
+            fi
+        fi
+
+        # 显示对端信息
+        local endpoint
+        endpoint=$(grep '^Endpoint' "$WG_CONFIG_FILE" 2>/dev/null | head -1 | awk '{print $3}') || endpoint=""
+        if [ -n "$endpoint" ]; then
+            echo -e "  对端地址: ${endpoint}"
+        fi
+
         if command -v wg >/dev/null 2>&1; then
             if wg show wg0 >/dev/null 2>&1; then
                 echo -e "  运行状态: ${GREEN}运行中${NC}"
+                # 显示最新握手时间
+                local latest_handshake
+                latest_handshake=$(wg show wg0 latest-handshakes 2>/dev/null | awk '{print $2}' | sort -rn | head -1) || latest_handshake=""
+                if [ -n "$latest_handshake" ] && [ "$latest_handshake" -gt 0 ] 2>/dev/null; then
+                    local ago=$(( $(date +%s) - latest_handshake ))
+                    if [ "$ago" -lt 180 ]; then
+                        echo -e "  最新握手: ${GREEN}${ago}秒前${NC}"
+                    else
+                        echo -e "  最新握手: ${RED}${ago}秒前${NC}"
+                    fi
+                fi
             else
                 echo -e "  运行状态: ${RED}未运行${NC}"
             fi
@@ -277,7 +306,7 @@ add_wg_peer() {
         return 1
     fi
 
-    if grep -q "PublicKey = $node_pubkey" "$WG_CONFIG_FILE"; then
+    if grep -q "PublicKey = $node_pubkey" "$WG_CONFIG_FILE" 2>/dev/null; then
         log_warn "Peer $node_name 已存在，跳过"
         return 0
     fi
@@ -925,17 +954,18 @@ main() {
                 esac
             done
             ;;
-        wg-init-hub) cmd_wg_init_hub ;;
-        wg-init-node) cmd_wg_init_node ;;
-        wg-add-node) cmd_wg_add_node ;;
-        maintain) cmd_maintain ;;
+        wg-init-hub) cmd_wg_init_hub; exit 0 ;;
+        wg-init-node) cmd_wg_init_node; exit 0 ;;
+        wg-add-node) cmd_wg_add_node; exit 0 ;;
+        maintain) cmd_maintain; exit 0 ;;
         install) 
             log_info "此脚本主要用于 WireGuard 隧道管理"
             log_info "直接运行进入交互菜单: sudo bash install.sh"
             log_info "Xboard-Node 安装请使用原版 install.sh"
+            exit 0
             ;;
-        upgrade) log_info "升级功能请参考原版 install.sh"; ;;
-        uninstall) log_info "卸载功能请参考原版 install.sh"; ;;
+        upgrade) log_info "升级功能请参考原版 install.sh"; exit 0 ;;
+        uninstall) log_info "卸载功能请参考原版 install.sh"; exit 0 ;;
         *)
             log_error "未知命令: $ACTION"
             usage
