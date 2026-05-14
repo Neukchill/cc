@@ -486,12 +486,14 @@ show_main_menu() {
     echo -e "  ${GREEN}3.${NC} 向 Hub 添加 Node"
     echo -e "  ${GREEN}4.${NC} 维护模式（更新配置，不重新生成密钥）"
     echo -e "  ${GREEN}5.${NC} 查看 WG 状态"
+    echo -e "  ${GREEN}6.${NC} 修改 WG 配置（编辑配置文件）"
+    echo -e "  ${GREEN}7.${NC} WG 启动 / 停止 / 重启"
     echo
     echo -e "  ${CYAN}── Xboard-Node 管理 ──${NC}"
-    echo -e "  ${GREEN}6.${NC} 安装/配置 Xboard-Node"
-    echo -e "  ${GREEN}7.${NC} 升级 Xboard-Node"
-    echo -e "  ${GREEN}8.${NC} 卸载 Xboard-Node"
-    echo -e "  ${GREEN}9.${NC} 查看整体状态"
+    echo -e "  ${GREEN}8.${NC} 安装/配置 Xboard-Node"
+    echo -e "  ${GREEN}9.${NC} 升级 Xboard-Node"
+    echo -e "  ${GREEN}a.${NC} 卸载 Xboard-Node"
+    echo -e "  ${GREEN}b.${NC} 查看整体状态"
     echo
     echo -e "  ${DIM}0. 退出${NC}"
     echo
@@ -750,6 +752,238 @@ interactive_status() {
 }
 
 # ============================================
+# 交互式编辑配置
+# ============================================
+interactive_edit_config() {
+    show_banner
+    echo -e "${BOLD}━━━ 修改 WireGuard 配置 ━━━${NC}"
+    echo
+
+    if [ ! -f "$WG_CONFIG_FILE" ]; then
+        log_error "WG 配置文件不存在: $WG_CONFIG_FILE"
+        pause; return
+    fi
+
+    echo -e "  配置路径: ${DIM}$WG_CONFIG_FILE${NC}"
+    echo
+    echo -e "${BOLD}请选择修改方式:${NC}"
+    echo -e "  ${GREEN}1.${NC} 直接编辑配置文件 (vi)"
+    echo -e "  ${GREEN}2.${NC} 修改本机隧道 IP"
+    echo -e "  ${GREEN}3.${NC} 修改对端 Endpoint"
+    echo -e "  ${GREEN}4.${NC} 修改对端公钥"
+    echo -e "  ${GREEN}5.${NC} 修改监听端口 (仅 Hub)"
+    echo -e "  ${GREEN}6.${NC} 查看完整配置文件"
+    echo -e "  ${DIM}0.${NC} 返回"
+    echo
+    read -r -p "选择: " choice
+
+    case "$choice" in
+        1)
+            # 备份后编辑
+            backup_wg_config
+            if command -v vi >/dev/null 2>&1; then
+                vi "$WG_CONFIG_FILE"
+            elif command -v nano >/dev/null 2>&1; then
+                nano "$WG_CONFIG_FILE"
+            else
+                log_error "未找到 vi 或 nano 编辑器"
+                pause; return
+            fi
+            echo
+            log_ok "配置已修改"
+            read -r -p "是否重启 WireGuard 使配置生效？(y/N): " reload
+            if [[ "$reload" =~ ^[Yy]$ ]]; then
+                wg_reload
+            fi
+            ;;
+        2)
+            echo
+            local current_ip
+            current_ip=$(grep '^Address' "$WG_CONFIG_FILE" 2>/dev/null | head -1 | awk '{print $3}') || current_ip="无"
+            echo -e "  当前隧道IP: ${DIM}${current_ip}${NC}"
+            local new_ip
+            new_ip=$(read_input "新隧道IP" "")
+            [ -z "$new_ip" ] && { log_warn "未修改"; pause; return; }
+            backup_wg_config
+            sed -i "0,/^Address = .*/s||Address = $new_ip|" "$WG_CONFIG_FILE"
+            log_ok "隧道IP 已更新为: $new_ip"
+            wg_reload
+            pause
+            ;;
+        3)
+            echo
+            local current_ep
+            current_ep=$(grep '^Endpoint' "$WG_CONFIG_FILE" 2>/dev/null | head -1 | awk '{print $3}') || current_ep="无"
+            echo -e "  当前对端: ${DIM}${current_ep}${NC}"
+            local new_ep
+            new_ep=$(read_input "新对端地址 (IP:端口)" "")
+            [ -z "$new_ep" ] && { log_warn "未修改"; pause; return; }
+            backup_wg_config
+            sed -i "s|Endpoint = .*|Endpoint = $new_ep|" "$WG_CONFIG_FILE"
+            log_ok "对端地址已更新为: $new_ep"
+            wg_reload
+            pause
+            ;;
+        4)
+            echo
+            local current_pk
+            current_pk=$(grep '^PublicKey' "$WG_CONFIG_FILE" 2>/dev/null | head -1 | awk '{print $3}') || current_pk="无"
+            echo -e "  当前对端公钥: ${DIM}${current_pk:0:20}...${NC}"
+            local new_pk
+            new_pk=$(read_input "新对端公钥" "")
+            [ -z "$new_pk" ] && { log_warn "未修改"; pause; return; }
+            backup_wg_config
+            sed -i "0,/^PublicKey = .*/s||PublicKey = $new_pk|" "$WG_CONFIG_FILE"
+            log_ok "对端公钥已更新"
+            wg_reload
+            pause
+            ;;
+        5)
+            local role
+            role=$(detect_wg_role)
+            if [ "$role" != "hub" ]; then
+                log_warn "监听端口仅 Hub 可修改"
+                pause; return
+            fi
+            echo
+            local current_port
+            current_port=$(grep '^ListenPort' "$WG_CONFIG_FILE" 2>/dev/null | awk '{print $3}') || current_port="无"
+            echo -e "  当前端口: ${DIM}${current_port}${NC}"
+            local new_port
+            new_port=$(read_input "新端口" "")
+            [ -z "$new_port" ] && { log_warn "未修改"; pause; return; }
+            backup_wg_config
+            sed -i "s/^ListenPort = .*/ListenPort = $new_port/" "$WG_CONFIG_FILE"
+            log_ok "监听端口已更新为: $new_port"
+            wg_reload
+            pause
+            ;;
+        6)
+            echo
+            echo -e "${DIM}──── $WG_CONFIG_FILE ────${NC}"
+            cat "$WG_CONFIG_FILE" 2>/dev/null || log_error "无法读取"
+            echo -e "${DIM}────────────────────${NC}"
+            echo
+            pause
+            ;;
+        *) ;;
+    esac
+}
+
+# ============================================
+# 交互式 WG 启停控制
+# ============================================
+interactive_wg_control() {
+    show_banner
+    echo -e "${BOLD}━━━ WireGuard 启动 / 停止 / 重启 ━━━${NC}"
+    echo
+
+    if [ ! -f "$WG_CONFIG_FILE" ]; then
+        log_error "WG 配置文件不存在，请先初始化"
+        pause; return
+    fi
+
+    # 显示当前状态
+    local running=0
+    if command -v wg >/dev/null 2>&1 && wg show wg0 >/dev/null 2>&1; then
+        running=1
+    fi
+
+    if [ "$running" -eq 1 ]; then
+        echo -e "  当前状态: ${GREEN}● 运行中${NC}"
+    else
+        echo -e "  当前状态: ${RED}○ 已停止${NC}"
+    fi
+    echo
+
+    if [ "$running" -eq 1 ]; then
+        echo -e "${BOLD}请选择操作:${NC}"
+        echo -e "  ${GREEN}1.${NC} 重启 WireGuard"
+        echo -e "  ${GREEN}2.${NC} 停止 WireGuard"
+        echo -e "  ${GREEN}3.${NC} 查看详细状态 (wg show)"
+        echo -e "  ${GREEN}4.${NC} 查看配置文件"
+        echo -e "  ${DIM}0.${NC} 返回"
+    else
+        echo -e "${BOLD}请选择操作:${NC}"
+        echo -e "  ${GREEN}1.${NC} 启动 WireGuard"
+        echo -e "  ${GREEN}2.${NC} 查看配置文件"
+        echo -e "  ${GREEN}3.${NC} 检查配置语法"
+        echo -e "  ${DIM}0.${NC} 返回"
+    fi
+    echo
+    read -r -p "选择: " choice
+
+    if [ "$running" -eq 1 ]; then
+        case "$choice" in
+            1)
+                log_step "重启 WireGuard..."
+                wg_reload
+                pause
+                ;;
+            2)
+                log_step "停止 WireGuard..."
+                if command -v wg-quick >/dev/null 2>&1; then
+                    wg-quick down wg0 2>/dev/null && log_ok "WireGuard 已停止" || log_warn "停止失败"
+                fi
+                pause
+                ;;
+            3)
+                echo
+                if command -v wg >/dev/null 2>&1; then
+                    wg show wg0 2>/dev/null || log_warn "无法获取状态"
+                else
+                    log_error "wg 命令不可用"
+                fi
+                echo
+                pause
+                ;;
+            4)
+                echo
+                echo -e "${DIM}──── $WG_CONFIG_FILE ────${NC}"
+                cat "$WG_CONFIG_FILE" 2>/dev/null
+                echo -e "${DIM}────────────────────${NC}"
+                echo
+                pause
+                ;;
+            *) ;;
+        esac
+    else
+        case "$choice" in
+            1)
+                log_step "启动 WireGuard..."
+                wg_reload
+                pause
+                ;;
+            2)
+                echo
+                echo -e "${DIM}──── $WG_CONFIG_FILE ────${NC}"
+                cat "$WG_CONFIG_FILE" 2>/dev/null
+                echo -e "${DIM}────────────────────${NC}"
+                echo
+                pause
+                ;;
+            3)
+                echo
+                log_step "检查配置语法..."
+                if command -v wg-quick >/dev/null 2>&1; then
+                    # strip 不实际启动，只解析配置
+                    if wg-quick strip wg0 >/dev/null 2>&1; then
+                        log_ok "配置语法正确"
+                    else
+                        log_error "配置语法有误"
+                    fi
+                else
+                    log_error "wg-quick 命令不可用"
+                fi
+                echo
+                pause
+                ;;
+            *) ;;
+        esac
+    fi
+}
+
+# ============================================
 # 命令行参数模式（WG 操作）
 # ============================================
 cmd_wg_init_hub() {
@@ -856,6 +1090,9 @@ usage() {
   wg-init-hub      初始化 Hub（中转服务器）
   wg-init-node     初始化 Node（落地服务器）
   wg-add-node      向 Hub 添加 Node
+  wg-start         启动 WireGuard
+  wg-stop          停止 WireGuard
+  wg-restart       重启 WireGuard
   maintain         维护模式（更新配置，不重新生成密钥）
   status           查看整体状态
   wg-status        查看 WG 状态
@@ -893,7 +1130,7 @@ parse_args() {
     local positional=()
     while [ $# -gt 0 ]; do
         case "$1" in
-            install|wg-init-hub|wg-init-node|wg-add-node|wg-update|wg-status|maintain|status|upgrade|uninstall|help)
+            install|wg-init-hub|wg-init-node|wg-add-node|wg-update|wg-status|wg-start|wg-stop|wg-restart|maintain|status|upgrade|uninstall|help)
                 ACTION="$1"; shift ;;
             --wg-port) WG_LISTEN_PORT="$2"; shift 2 ;;
             --wg-endpoint) WG_ENDPOINT="$2"; shift 2 ;;
@@ -945,10 +1182,12 @@ main() {
                     3) interactive_wg_add_node ;;
                     4) interactive_maintain ;;
                     5) show_wg_config_info; pause ;;
-                    6) log_info "Xboard-Node 安装功能请使用命令行参数"; pause ;;
-                    7) log_info "Xboard-Node 升级功能请使用命令行参数"; pause ;;
-                    8) log_info "Xboard-Node 卸载功能请使用命令行参数"; pause ;;
-                    9) interactive_status ;;
+                    6) interactive_edit_config ;;
+                    7) interactive_wg_control ;;
+                    8) log_info "Xboard-Node 安装功能请使用命令行参数"; pause ;;
+                    9) log_info "Xboard-Node 升级功能请使用命令行参数"; pause ;;
+                    a|A) log_info "Xboard-Node 卸载功能请使用命令行参数"; pause ;;
+                    b|B) interactive_status ;;
                     0|q|Q|exit) log_info "再见！"; exit 0 ;;
                     *) log_warn "无效选项: $choice"; pause ;;
                 esac
@@ -957,6 +1196,16 @@ main() {
         wg-init-hub) cmd_wg_init_hub; exit 0 ;;
         wg-init-node) cmd_wg_init_node; exit 0 ;;
         wg-add-node) cmd_wg_add_node; exit 0 ;;
+        wg-start)
+            log_step "启动 WireGuard..."
+            wg_reload; exit 0 ;;
+        wg-stop)
+            log_step "停止 WireGuard..."
+            wg-quick down wg0 2>/dev/null && log_ok "已停止" || log_warn "停止失败"
+            exit 0 ;;
+        wg-restart)
+            log_step "重启 WireGuard..."
+            wg_reload; exit 0 ;;
         maintain) cmd_maintain; exit 0 ;;
         install) 
             log_info "此脚本主要用于 WireGuard 隧道管理"
