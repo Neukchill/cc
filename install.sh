@@ -45,7 +45,14 @@ log_ok()    { echo -e "${GREEN}  ✓ $1${NC}"; }
 pause() { echo; read -r -p "按 Enter 继续..."; }
 clear_screen() { clear 2>/dev/null || true; }
 
-check_root() { [ "$(id -u)" -ne 0 ] && log_error "需要 root 权限" && exit 1; }
+check_root() {
+    local uid
+    uid=$(id -u 2>/dev/null) || uid=1000
+    if [ "$uid" -ne 0 ]; then
+        echo -e "\033[0;31m[错误] 需要 root 权限，请使用 sudo 运行\033[0m"
+        exit 1
+    fi
+}
 
 detect_os() {
     if [ -f /etc/os-release ]; then
