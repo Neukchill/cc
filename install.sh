@@ -1,565 +1,729 @@
-#!/usr/bin/env bash
-set -Eeo pipefail
+#!/bin/bash
+# =============================================================================
+#  wg-relay — 一键 WireGuard 中转/落地部署脚本
+# -----------------------------------------------------------------------------
+#  适用场景：GA/Anycast → 中转机 (Hub) → WireGuard → 落地机 (Node) → 出口
+#  承载协议：SUDOKU / VLESS / Trojan / Hysteria 等任意 TCP/UDP 代理
+#
+#  特性：
+#    - 系统调优 (sysctl) + BBR + fq + 大缓冲 + conntrack
+#    - 开启 IP 转发 + RPS 多核分散（systemd 持久化）
+#    - WireGuard 安装 + 自动密钥生成 + MTU 1420
+#    - Hub 模式：监听端，支持后续动态添加多个落地 (add-node)
+#    - Node 模式：落地端，自动写好回连配置
+#    - DNAT 端口映射：一个中转机可同时挂多个落地，靠端口区分
+#
+#  用法：
+#    sudo bash install.sh install      # 交互式安装（角色: hub | node）
+#    sudo bash install.sh add-node     # Hub 上：新增一个落地 peer + DNAT
+#    sudo bash install.sh status       # 查看 WG 状态与端口映射
+#    sudo bash install.sh tune         # 仅应用系统调优（不装 WG）
+#    sudo bash install.sh uninstall    # 卸载 WG 与映射规则（保留 sysctl）
+#
+#  License: MIT
+# =============================================================================
 
-# 错误处理
-trap 'echo -e "\033[0;31m[错误] 脚本在第 $LINENO 行出错 (退出码=$?)\033[0m"' ERR
+set -euo pipefail
 
-# ============================================
-# WireGuard 中继管理脚本 - 完整版 v3
-# 功能：
-#   1. 系统调优：BBR + fq + TCP Fast Open + MTU Probing + 大缓冲
-#   2. conntrack 调优：连接跟踪表 1M、hashsize 256K
-#   3. RPS 多核分散：systemd 持久化
-#   4. WireGuard：自动安装、密钥、MTU 1420
-#   5. Hub：单中转机挂任意多落地
-#   6. Node：自动回连 + PersistentKeepalive=25
-#   7. add-node：动态加 peer + DNAT，wg syncconf 热加载
-#   8. iptables 持久化
-#   9. 幂等：重复运行不破坏配置
-# ============================================
+# ----- 常量 ------------------------------------------------------------------
+readonly WG_DIR="/etc/wireguard"
+readonly WG_IF="wg0"
+readonly WG_CONF="${WG_DIR}/${WG_IF}.conf"
+readonly WG_PORT_DEFAULT=51820
+readonly WG_MTU_DEFAULT=1420
+readonly WG_SUBNET_DEFAULT="10.66.0"        # 10.66.0.0/24，避开常见冲突
+readonly SYSCTL_FILE="/etc/sysctl.d/99-wg-relay.conf"
+readonly RPS_SERVICE="/etc/systemd/system/wg-rps.service"
+readonly RPS_SCRIPT="/usr/local/sbin/wg-rps-apply.sh"
+readonly STATE_FILE="${WG_DIR}/.wg-relay.state"   # 记录角色 + 端口映射
+readonly SCRIPT_VERSION="1.1.0"
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+# ----- 颜色输出 --------------------------------------------------------------
+if [[ -t 1 ]]; then
+    C_RED=$'\033[0;31m'; C_GRN=$'\033[0;32m'; C_YEL=$'\033[1;33m'
+    C_BLU=$'\033[0;34m'; C_CYN=$'\033[0;36m'; C_BLD=$'\033[1m'; C_RST=$'\033[0m'
+else
+    C_RED=''; C_GRN=''; C_YEL=''; C_BLU=''; C_CYN=''; C_BLD=''; C_RST=''
+fi
+log()    { echo -e "${C_BLU}[*]${C_RST} $*"; }
+ok()     { echo -e "${C_GRN}[✓]${C_RST} $*"; }
+warn()   { echo -e "${C_YEL}[!]${C_RST} $*"; }
+err()    { echo -e "${C_RED}[✗]${C_RST} $*" >&2; }
+title()  { echo -e "\n${C_BLD}${C_CYN}== $* ==${C_RST}"; }
 
-WG_CONFIG_DIR="/etc/wireguard"
-WG_CONFIG_FILE="${WG_CONFIG_DIR}/wg0.conf"
-WG_ROLE_FILE="${WG_CONFIG_DIR}/.role"
-WG_PEERS_FILE="${WG_CONFIG_DIR}/.peers"
-SYSCTL_CONF="/etc/sysctl.d/99-wg-relay.conf"
-RPS_SERVICE="/etc/systemd/system/rps-affinity.service"
-
-DEFAULT_WG_PORT="48940"; DEFAULT_WG_MTU="1420"
-DEFAULT_TUNNEL_IP_HUB="10.8.0.1/24"
-DEFAULT_TUNNEL_IP_NODE="10.8.0.2/24"
-
-ACTION=""; WG_ROLE=""; WG_LISTEN_PORT="$DEFAULT_WG_PORT"
-WG_ENDPOINT=""; WG_PEER_PUBKEY=""; WG_PEER_PSK=""
-WG_TUNNEL_IP=""; NODE_NAME=""; EXTERNAL_PORT=""
-
-log_info()  { echo -e "${GREEN}[信息]${NC} $1"; }
-log_warn()  { echo -e "${YELLOW}[警告]${NC} $1"; }
-log_error() { echo -e "${RED}[错误]${NC} $1"; }
-log_step()  { echo -e "${CYAN}[步骤]${NC} ${BOLD}$1${NC}"; }
-log_ok()    { echo -e "${GREEN}  ✓ $1${NC}"; }
-
-pause() { echo; read -r -p "按 Enter 继续..."; }
-clear_screen() { clear 2>/dev/null || true; }
-
-check_root() {
-    local uid
-    uid=$(id -u 2>/dev/null) || uid=1000
-    if [ "$uid" -ne 0 ]; then
-        echo -e "\033[0;31m[错误] 需要 root 权限，请使用 sudo 运行\033[0m"
+# ----- 前置检查 --------------------------------------------------------------
+require_root() {
+    if [[ $EUID -ne 0 ]]; then
+        err "请使用 root 运行（sudo bash $0 ...）"
         exit 1
     fi
 }
 
 detect_os() {
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release 2>/dev/null || true
-        echo "${ID:-unknown}"
-    else
-        echo "unknown"
+    if [[ ! -f /etc/os-release ]]; then
+        err "无法识别系统（缺 /etc/os-release）"
+        exit 1
     fi
-}
-
-# ============================================
-# 系统调优
-# ============================================
-optimize_system() {
-    log_step "系统调优..."
-    local os=$(detect_os)
-    
-    case "$os" in
-        ubuntu|debian)
-            DEBIAN_FRONTEND=noninteractive apt-get update -qq 2>/dev/null || true
-            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wireguard-tools iptables-persistent netfilter-persistent curl wget 2>/dev/null || true
-            ;;
-        centos|rhel|rocky|almalinux|fedora)
-            (command -v dnf >/dev/null 2>&1 && dnf install -y -q wireguard-tools iptables-services) || yum install -y -q wireguard-tools iptables-services
-            ;;
+    # shellcheck source=/dev/null
+    . /etc/os-release
+    case "${ID:-}" in
+        debian|ubuntu) PKG_MGR="apt" ;;
+        centos|rhel|rocky|almalinux|fedora) PKG_MGR="dnf" ;;
+        *) err "目前仅支持 Debian/Ubuntu/RHEL 系，当前: ${ID:-unknown}"; exit 1 ;;
     esac
-    
-    if [ ! -f "$SYSCTL_CONF" ]; then
-        log_info "配置系统参数..."
-        cat > "$SYSCTL_CONF" <<'EOF'
-net.ipv4.tcp_congestion_control=bbr
-net.core.default_qdisc=fq
-net.ipv4.tcp_fastopen=3
-net.ipv4.tcp_mtu_probing=1
-net.ipv4.tcp_base_mss=1024
-net.core.rmem_max=134217728
-net.core.wmem_max=134217728
-net.ipv4.tcp_rmem=4096 87380 134217728
-net.ipv4.tcp_wmem=4096 65536 134217728
-net.core.netdev_max_backlog=65536
-net.ipv4.tcp_notsent_lowat=16384
-net.ipv4.ip_local_port_range=1024 65535
-net.netfilter.nf_conntrack_max=1048576
-net.netfilter.nf_conntrack_tcp_timeout_established=600
-net.netfilter.nf_conntrack_tcp_timeout_close_wait=60
-net.netfilter.nf_conntrack_tcp_timeout_fin_wait=60
-net.netfilter.nf_conntrack_tcp_timeout_time_wait=60
-net.netfilter.nf_conntrack_udp_timeout=60
-net.netfilter.nf_conntrack_udp_timeout_stream=120
-EOF
-        sysctl --system >/dev/null 2>&1 || true
-        log_ok "系统参数已配置"
-    else
-        log_info "系统参数已配置，跳过"
-    fi
-    
-    # conntrack
-    if [ -f /proc/sys/net/netfilter/nf_conntrack_max ]; then
-        echo 1048576 > /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || true
-    fi
-    if [ -f /sys/module/nf_conntrack/parameters/hashsize ]; then
-        echo 262144 > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || true
-    fi
-    log_ok "conntrack 已优化"
-    
-    # RPS
-    setup_rps
-    
-    log_ok "系统调优完成"
+    ok "系统: ${PRETTY_NAME:-$ID} (包管理器: $PKG_MGR)"
 }
 
+get_egress_iface() {
+    ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
+}
+
+get_public_ip() {
+    local ip
+    ip=$(curl -fsS4 --max-time 5 https://api.ipify.org 2>/dev/null) \
+        || ip=$(curl -fsS4 --max-time 5 https://ifconfig.me 2>/dev/null) \
+        || ip=""
+    echo "$ip"
+}
+
+# ----- 1. 系统调优 -----------------------------------------------------------
+apply_sysctl() {
+    title "应用系统内核调优"
+
+    cat > "$SYSCTL_FILE" <<'EOF'
+# wg-relay tuning — managed file, do not edit by hand
+# ---- TCP / 拥塞 / 缓冲 ----
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+net.ipv4.tcp_rmem = 4096 87380 33554432
+net.ipv4.tcp_wmem = 4096 65536 33554432
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_notsent_lowat = 131072
+net.core.netdev_max_backlog = 16384
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_reordering = 8
+net.ipv4.tcp_tw_reuse = 1
+
+# ---- 转发 ----
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+
+# ---- conntrack（中转机尤其需要）----
+net.netfilter.nf_conntrack_max = 1048576
+net.netfilter.nf_conntrack_tcp_timeout_established = 600
+net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
+net.netfilter.nf_conntrack_tcp_timeout_close_wait = 30
+net.netfilter.nf_conntrack_tcp_timeout_fin_wait = 30
+EOF
+
+    # nf_conntrack 模块 + hashsize（开机加载）
+    modprobe nf_conntrack 2>/dev/null || true
+    if [[ -w /sys/module/nf_conntrack/parameters/hashsize ]]; then
+        echo 262144 > /sys/module/nf_conntrack/parameters/hashsize || true
+    fi
+    echo "options nf_conntrack hashsize=262144" > /etc/modprobe.d/nf_conntrack.conf
+    grep -q '^nf_conntrack' /etc/modules-load.d/wg-relay.conf 2>/dev/null \
+        || echo nf_conntrack > /etc/modules-load.d/wg-relay.conf
+
+    sysctl --system >/dev/null 2>&1 || sysctl -p "$SYSCTL_FILE" >/dev/null
+    ok "sysctl 已写入 $SYSCTL_FILE 并生效"
+
+    # 验证关键项
+    local cc qd fwd
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo ?)
+    qd=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo ?)
+    fwd=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo ?)
+    echo "    BBR=${cc}  qdisc=${qd}  ip_forward=${fwd}"
+    [[ "$cc" == "bbr" ]] || warn "BBR 未生效，可能内核 < 4.9 或模块缺失"
+}
+
+# ----- 2. RPS 多核分散 -------------------------------------------------------
 setup_rps() {
-    log_step "配置 RPS..."
-    local ifaces=$(ls /sys/class/net/ 2>/dev/null | grep -v '^lo$' || true)
-    [ -z "$ifaces" ] && { log_warn "无网卡"; return; }
-    
-    local cpu=$(nproc 2>/dev/null || echo 1)
-    local mask
-    [ "$cpu" -le 32 ] && mask=$(printf '%x' $(( (1 << cpu) - 1 ))) || mask="ffffffff"
-    
-    if [ ! -f "$RPS_SERVICE" ]; then
-        cat > "$RPS_SERVICE" <<EOF
+    title "配置 RPS（多核处理网络中断）"
+
+    cat > "$RPS_SCRIPT" <<'RPSEOF'
+#!/bin/bash
+# wg-relay RPS apply — 把网卡 RX 队列分散到所有 CPU
+set -e
+cores=$(nproc)
+mask=$(printf '%x' $((2**cores - 1)))
+applied=0
+for nic in $(ls /sys/class/net/); do
+    case "$nic" in lo|docker*|br-*|veth*|virbr*) continue ;; esac
+    [[ -d /sys/class/net/$nic/queues ]] || continue
+    for q in /sys/class/net/$nic/queues/rx-*/rps_cpus; do
+        [[ -w "$q" ]] && echo "$mask" > "$q" 2>/dev/null && applied=1 || true
+    done
+done
+exit 0
+RPSEOF
+    chmod +x "$RPS_SCRIPT"
+
+    cat > "$RPS_SERVICE" <<EOF
 [Unit]
-Description=RPS
-After=network.target
+Description=wg-relay RPS multicore distribution
+After=network-online.target wg-quick@${WG_IF}.service
+Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -c 'for i in $ifaces; do for f in /sys/class/net/\$i/queues/rx-*/rps_cpus; do echo $mask > \$f 2>/dev/null || true; done; done'
+ExecStart=${RPS_SCRIPT}
 RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
 EOF
-        systemctl daemon-reload >/dev/null 2>&1 || true
-        systemctl enable rps-affinity.service >/dev/null 2>&1 || true
-        systemctl start rps-affinity.service >/dev/null 2>&1 || true
+
+    systemctl daemon-reload
+    systemctl enable --now wg-rps.service >/dev/null 2>&1 || true
+
+    # 立即应用一次
+    bash "$RPS_SCRIPT" || true
+
+    local cores mask
+    cores=$(nproc)
+    mask=$(printf '%x' $((2**cores - 1)))
+    ok "RPS 已应用到 ${cores} 核 (mask=0x${mask})，并设为开机自启"
+}
+
+# ----- 3. 安装 WireGuard 与依赖 ----------------------------------------------
+install_packages() {
+    title "安装 WireGuard 及依赖"
+    if [[ "$PKG_MGR" == "apt" ]]; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq
+        apt-get install -y -qq wireguard wireguard-tools iptables \
+            iptables-persistent netfilter-persistent curl jq qrencode \
+            >/dev/null
+    else
+        $PKG_MGR install -y -q epel-release 2>/dev/null || true
+        $PKG_MGR install -y -q wireguard-tools iptables iptables-services \
+            curl jq qrencode >/dev/null
+        systemctl enable --now iptables 2>/dev/null || true
     fi
-    
-    for i in $ifaces; do
-        for f in /sys/class/net/$i/queues/rx-*/rps_cpus; do
-            [ -f "$f" ] && echo "$mask" > "$f" 2>/dev/null || true
-        done
-    done
-    log_ok "RPS 已配置"
+    ok "$(wg --version | head -n1)"
 }
 
-# ============================================
-# WG 核心
-# ============================================
-generate_wg_keypair() {
-    local priv=$(wg genkey)
-    echo "${priv}:$(echo "$priv" | wg pubkey)"
-}
-
-detect_wg_role() {
-    if [ -f "$WG_ROLE_FILE" ]; then cat "$WG_ROLE_FILE" 2>/dev/null | tr -d '[:space:]'; return; fi
-    if [ -f "$WG_CONFIG_FILE" ]; then
-        local peers=$(grep -c '^\[Peer\]' "$WG_CONFIG_FILE" 2>/dev/null || echo 0)
-        [ "$peers" -gt 1 ] && echo "hub" && return
-        [ "$peers" -eq 1 ] && grep -q '^ListenPort' "$WG_CONFIG_FILE" 2>/dev/null && echo "hub" || echo "node"
+# ----- 4. 密钥与配置 ---------------------------------------------------------
+ensure_keys() {
+    mkdir -p "$WG_DIR"
+    chmod 700 "$WG_DIR"
+    if [[ ! -s "$WG_DIR/private.key" ]]; then
+        umask 077
+        wg genkey | tee "$WG_DIR/private.key" | wg pubkey > "$WG_DIR/public.key"
+        chmod 600 "$WG_DIR/private.key" "$WG_DIR/public.key"
+        ok "已生成新的 WG 密钥对"
+    else
+        log "已存在密钥，跳过生成"
     fi
 }
 
-backup_wg_config() {
-    [ -f "$WG_CONFIG_FILE" ] && cp "$WG_CONFIG_FILE" "${WG_CONFIG_FILE}.backup.$(date +%Y%m%d-%H%M%S)"
-    log_info "配置已备份"
-}
-
-wg_reload() {
-    if ! command -v wg-quick >/dev/null 2>&1; then log_warn "wg-quick 不可用"; return 1; fi
-    
-    if wg show wg0 >/dev/null 2>&1; then
-        wg syncconf wg0 <(wg-quick strip wg0 2>/dev/null || cat "$WG_CONFIG_FILE") 2>/dev/null && log_ok "配置已热加载" && return 0
+backup_conf() {
+    if [[ -f "$WG_CONF" ]]; then
+        local bk
+        bk="${WG_CONF}.bak.$(date +%s)"
+        cp -a "$WG_CONF" "$bk"
+        warn "已备份原配置到 $bk"
     fi
-    
-    wg-quick down wg0 2>/dev/null || true
-    wg-quick up wg0 2>/dev/null && log_ok "WireGuard 已启动" && return 0
-    log_warn "启动失败"
-    return 1
 }
 
-save_iptables_rules() {
-    log_step "保存 iptables..."
-    local os=$(detect_os)
-    case "$os" in
-        ubuntu|debian)
-            mkdir -p /etc/iptables
-            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-            systemctl enable netfilter-persistent 2>/dev/null || true
-            ;;
-        centos|rhel|rocky|almalinux|fedora)
-            service iptables save 2>/dev/null || true
-            ;;
-    esac
-    log_ok "iptables 已保存"
-}
-
-# ============================================
-# Hub
-# ============================================
-init_hub() {
-    log_step "初始化 Hub"
-    
-    local current=$(detect_wg_role)
-    if [ -n "$current" ] && [ "$current" != "hub" ]; then
-        log_warn "当前是 $current，切换将覆盖！"
-        read -r -p "输入 YES 确认: " confirm
-        [ "$confirm" != "YES" ] && { log_warn "已取消"; return 1; }
+write_state() {
+    # key=value 格式，保存角色等
+    local k="$1" v="$2"
+    touch "$STATE_FILE"
+    chmod 600 "$STATE_FILE"
+    if grep -q "^${k}=" "$STATE_FILE" 2>/dev/null; then
+        sed -i "s|^${k}=.*|${k}=${v}|" "$STATE_FILE"
+    else
+        echo "${k}=${v}" >> "$STATE_FILE"
     fi
-    
-    backup_wg_config
-    
-    local keys=$(generate_wg_keypair)
-    local priv=$(echo "$keys" | cut -d: -f1)
-    local pub=$(echo "$keys" | cut -d: -f2)
-    
-    mkdir -p "$WG_CONFIG_DIR" && chmod 700 "$WG_CONFIG_DIR"
-    
-    cat > "$WG_CONFIG_FILE" <<EOF
+}
+
+read_state() {
+    local k="$1"
+    [[ -f "$STATE_FILE" ]] || return 1
+    grep "^${k}=" "$STATE_FILE" 2>/dev/null | head -n1 | cut -d= -f2-
+}
+
+# ----- 5a. Hub（中转机）配置 -------------------------------------------------
+configure_hub() {
+    title "配置中转机 (Hub)"
+
+    local egress wg_port wg_mtu wg_subnet hub_ip pub_ip
+    egress=$(get_egress_iface)
+    [[ -z "$egress" ]] && { err "无法识别出网网卡"; exit 1; }
+    log "出网网卡: $egress"
+
+    # 从 state 读取默认值（重装时沿用上次配置）
+    local saved_port saved_subnet saved_mtu
+    saved_port=$(read_state WG_PORT 2>/dev/null || echo "$WG_PORT_DEFAULT")
+    saved_subnet=$(read_state WG_SUBNET 2>/dev/null || echo "$WG_SUBNET_DEFAULT")
+    saved_mtu=$(read_state WG_MTU 2>/dev/null || echo "$WG_MTU_DEFAULT")
+
+    read -rp "WireGuard 监听端口 [${saved_port}]: " wg_port
+    wg_port=${wg_port:-$saved_port}
+    read -rp "WG 隧道 MTU [${saved_mtu}]: " wg_mtu
+    wg_mtu=${wg_mtu:-$saved_mtu}
+    read -rp "WG 隧道 /24 子网前缀 [${saved_subnet}]: " wg_subnet
+    wg_subnet=${wg_subnet:-$saved_subnet}
+    hub_ip="${wg_subnet}.1"
+
+    backup_conf
+    ensure_keys
+    local priv pub
+    priv=$(cat "$WG_DIR/private.key")
+    pub=$(cat "$WG_DIR/public.key")
+
+    cat > "$WG_CONF" <<EOF
 [Interface]
-PrivateKey = $priv
-Address = ${WG_TUNNEL_IP:-$DEFAULT_TUNNEL_IP_HUB}
-ListenPort = ${WG_LISTEN_PORT:-$DEFAULT_WG_PORT}
-MTU = $DEFAULT_WG_MTU
-PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
-PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+# Role: HUB  Subnet: ${wg_subnet}.0/24  Egress: ${egress}
+PrivateKey = ${priv}
+Address    = ${hub_ip}/24
+ListenPort = ${wg_port}
+MTU        = ${wg_mtu}
+
+# 转发 + 对落地 SNAT（让落地回包走回 wg0，避免非对称路由）
+PostUp   = iptables -A FORWARD -i %i -j ACCEPT
+PostUp   = iptables -A FORWARD -o %i -j ACCEPT
+PostUp   = iptables -t nat -A POSTROUTING -o %i -j MASQUERADE
+PostDown = iptables -D FORWARD -i %i -j ACCEPT
+PostDown = iptables -D FORWARD -o %i -j ACCEPT
+PostDown = iptables -t nat -D POSTROUTING -o %i -j MASQUERADE
+
+# ----- Peers 由 add-node 自动追加，请勿手动编辑下方 -----
 EOF
-    
-    chmod 600 "$WG_CONFIG_FILE"
-    echo "hub" > "$WG_ROLE_FILE"
-    echo "$pub" > "${WG_CONFIG_DIR}/.pubkey"
-    
-    log_ok "Hub 已初始化"
-    echo
-    log_info "公钥: $pub"
-    echo "  bash $0 init-node --endpoint <IP>:${WG_LISTEN_PORT:-$DEFAULT_WG_PORT} --pubkey $pub"
-    
-    wg_reload
-    save_iptables_rules
+    chmod 600 "$WG_CONF"
+
+    write_state "ROLE" "hub"
+    write_state "WG_PORT" "$wg_port"
+    write_state "WG_MTU" "$wg_mtu"
+    write_state "WG_SUBNET" "$wg_subnet"
+    write_state "EGRESS" "$egress"
+
+    systemctl enable wg-quick@${WG_IF} >/dev/null 2>&1
+    systemctl restart wg-quick@${WG_IF}
+    ok "WireGuard 已启动 (${WG_IF})"
+
+    pub_ip=$(get_public_ip)
+
+    cat <<EOF
+
+${C_BLD}${C_GRN}========== Hub 部署完成 ==========${C_RST}
+  角色:        中转机 (Hub)
+  公网 IP:     ${pub_ip:-<未检测到>}
+  WG 端口:     ${wg_port}
+  WG 子网:     ${wg_subnet}.0/24   (Hub = ${hub_ip})
+  MTU:         ${wg_mtu}
+  本机公钥:    ${C_YEL}${pub}${C_RST}
+${C_BLD}===================================${C_RST}
+
+${C_CYN}下一步：${C_RST}
+  1) 在每台落地机执行：
+       sudo bash install.sh install   # 选 node，填入上面的 公网IP / 端口 / 公钥
+  2) 落地机部署完成后，回到本机执行：
+       sudo bash install.sh add-node
+     录入落地的【公钥】+【对外端口】+【落地服务端口】，自动加 Peer 与 DNAT。
+EOF
 }
 
-# ============================================
-# Node
-# ============================================
-init_node() {
-    log_step "初始化 Node"
-    
-    [ -z "$WG_ENDPOINT" ] && { log_error "缺少 --endpoint"; return 1; }
-    [ -z "$WG_PEER_PUBKEY" ] && { log_error "缺少 --pubkey"; return 1; }
-    
-    local current=$(detect_wg_role)
-    if [ -n "$current" ] && [ "$current" != "node" ]; then
-        log_warn "当前是 $current，切换将覆盖！"
-        read -r -p "输入 YES 确认: " confirm
-        [ "$confirm" != "YES" ] && { log_warn "已取消"; return 1; }
+# ----- 5b. Node（落地机）配置 ------------------------------------------------
+configure_node() {
+    title "配置落地机 (Node)"
+
+    # 从 state 读取默认值（重装时沿用上次配置）
+    local saved_hub_ip saved_hub_port saved_subnet saved_mtu saved_node_addr saved_node_idx
+    saved_hub_ip=$(read_state HUB_IP 2>/dev/null || echo "")
+    saved_hub_port=$(read_state HUB_PORT 2>/dev/null || echo "$WG_PORT_DEFAULT")
+    saved_subnet=$(read_state WG_SUBNET 2>/dev/null || echo "$WG_SUBNET_DEFAULT")
+    saved_mtu=$(read_state WG_MTU 2>/dev/null || echo "$WG_MTU_DEFAULT")
+    saved_node_addr=$(read_state NODE_ADDR 2>/dev/null || echo "")
+    # 从上次 NODE_ADDR 解析 idx（例 10.66.0.3 → 3）
+    saved_node_idx="${saved_node_addr##*.}"
+    [[ -z "$saved_node_idx" || "$saved_node_idx" == "$saved_node_addr" ]] && saved_node_idx=2
+
+    local hub_ip hub_port hub_pub wg_subnet node_idx wg_mtu
+    read -rp "中转机 (Hub) 公网 IP/域名${saved_hub_ip:+ [${saved_hub_ip}]}: " hub_ip
+    hub_ip=${hub_ip:-$saved_hub_ip}
+    [[ -z "$hub_ip" ]] && { err "Hub 地址不能为空"; exit 1; }
+    read -rp "Hub WireGuard 端口 [${saved_hub_port}]: " hub_port
+    hub_port=${hub_port:-$saved_hub_port}
+    read -rp "Hub 公钥: " hub_pub
+    [[ -z "$hub_pub" ]] && { err "Hub 公钥不能为空"; exit 1; }
+    read -rp "WG 子网前缀（与 Hub 一致）[${saved_subnet}]: " wg_subnet
+    wg_subnet=${wg_subnet:-$saved_subnet}
+    read -rp "本机在 WG 子网中的序号（2-254，每台落地需唯一）[${saved_node_idx}]: " node_idx
+    node_idx=${node_idx:-$saved_node_idx}
+    if ! [[ "$node_idx" =~ ^[0-9]+$ ]] || (( node_idx < 2 || node_idx > 254 )); then
+        err "序号必须是 2-254 的整数"; exit 1
     fi
-    
-    backup_wg_config
-    
-    local keys=$(generate_wg_keypair)
-    local priv=$(echo "$keys" | cut -d: -f1)
-    local pub=$(echo "$keys" | cut -d: -f2)
-    
-    mkdir -p "$WG_CONFIG_DIR" && chmod 700 "$WG_CONFIG_DIR"
-    
-    local psk=""
-    [ -n "$WG_PEER_PSK" ] && psk="PresharedKey = $WG_PEER_PSK"
-    
-    cat > "$WG_CONFIG_FILE" <<EOF
+    read -rp "WG 隧道 MTU [${saved_mtu}]: " wg_mtu
+    wg_mtu=${wg_mtu:-$saved_mtu}
+
+    backup_conf
+    ensure_keys
+    local priv pub node_addr
+    priv=$(cat "$WG_DIR/private.key")
+    pub=$(cat "$WG_DIR/public.key")
+    node_addr="${wg_subnet}.${node_idx}"
+
+    cat > "$WG_CONF" <<EOF
 [Interface]
-PrivateKey = $priv
-Address = ${WG_TUNNEL_IP:-$DEFAULT_TUNNEL_IP_NODE}
-MTU = $DEFAULT_WG_MTU
+# Role: NODE  Address: ${node_addr}
+PrivateKey = ${priv}
+Address    = ${node_addr}/24
+MTU        = ${wg_mtu}
 
 [Peer]
-PublicKey = $WG_PEER_PUBKEY
-$psk
-Endpoint = $WG_ENDPOINT
-AllowedIPs = 0.0.0.0/0
+# Hub
+PublicKey           = ${hub_pub}
+Endpoint            = ${hub_ip}:${hub_port}
+AllowedIPs          = ${wg_subnet}.0/24
 PersistentKeepalive = 25
 EOF
-    
-    chmod 600 "$WG_CONFIG_FILE"
-    echo "node" > "$WG_ROLE_FILE"
-    echo "$pub" > "${WG_CONFIG_DIR}/.pubkey"
-    
-    log_ok "Node 已初始化"
-    echo
-    log_info "公钥: $pub"
-    echo "  bash $0 add-node --pubkey $pub --ip ${WG_TUNNEL_IP:-$DEFAULT_TUNNEL_IP_NODE}"
-    
-    wg_reload
-}
+    chmod 600 "$WG_CONF"
 
-# ============================================
-# add-node
-# ============================================
-add_node() {
-    log_step "添加 Node"
-    
-    [ -z "$WG_PEER_PUBKEY" ] && { log_error "缺少 --pubkey"; return 1; }
-    [ -z "$WG_TUNNEL_IP" ] && { log_error "缺少 --ip"; return 1; }
-    [ "$(detect_wg_role)" != "hub" ] && { log_error "当前不是 Hub"; return 1; }
-    
-    local node_ip=$(echo "$WG_TUNNEL_IP" | cut -d/ -f1)
-    
-    # 幂等检查
-    if grep -q "PublicKey = $WG_PEER_PUBKEY" "$WG_CONFIG_FILE" 2>/dev/null; then
-        log_warn "该 Node 已存在，跳过"
-        return 0
-    fi
-    
-    backup_wg_config
-    
-    local name="${NODE_NAME:-node-$(date +%s)}"
-    local ext_port
-    [ -n "$EXTERNAL_PORT" ] && ext_port="$EXTERNAL_PORT" || ext_port=$((50000 + $(grep -c '^\[Peer\]' "$WG_CONFIG_FILE" 2>/dev/null || echo 0)))
-    
-    local psk=""
-    [ -n "$WG_PEER_PSK" ] && psk="PresharedKey = $WG_PEER_PSK"
-    
-    cat >> "$WG_CONFIG_FILE" <<EOF
+    write_state "ROLE" "node"
+    write_state "WG_MTU" "$wg_mtu"
+    write_state "WG_SUBNET" "$wg_subnet"
+    write_state "NODE_ADDR" "$node_addr"
+    write_state "HUB_IP" "$hub_ip"
+    write_state "HUB_PORT" "$hub_port"
 
-# $name
-[Peer]
-PublicKey = $WG_PEER_PUBKEY
-$psk
-AllowedIPs = ${node_ip}/32
-EOF
-    
-    log_ok "已添加 $name (${node_ip})"
-    
-    # DNAT 规则
-    if ! iptables -t nat -C PREROUTING -p udp --dport "$ext_port" -j DNAT --to-destination "${node_ip}:$DEFAULT_WG_PORT" 2>/dev/null; then
-        iptables -t nat -A PREROUTING -p udp --dport "$ext_port" -j DNAT --to-destination "${node_ip}:$DEFAULT_WG_PORT" 2>/dev/null || true
-        iptables -t nat -A POSTROUTING -d "$node_ip" -p udp --dport "$DEFAULT_WG_PORT" -j MASQUERADE 2>/dev/null || true
-        log_ok "DNAT 已添加: 外部 $ext_port -> ${node_ip}"
-    fi
-    
-    echo "${name}:${WG_PEER_PUBKEY}:${node_ip}:${ext_port}" >> "$WG_PEERS_FILE"
-    
-    wg_reload
-    save_iptables_rules
-    
-    log_ok "Node 添加完成！外部端口: $ext_port"
-}
+    systemctl enable wg-quick@${WG_IF} >/dev/null 2>&1
+    systemctl restart wg-quick@${WG_IF}
+    ok "WireGuard 已启动"
 
-# ============================================
-# 状态
-# ============================================
-show_status() {
-    clear_screen
-    echo -e "${CYAN}${BOLD}"
-    echo "  ╔═══════════════════════════════════════╗"
-    echo "  ║   WireGuard 中继管理工具 v3       ║"
-    echo "  ╚═══════════════════════════════════════╝"
-    echo -e "${NC}"
-    
-    echo -e "${BOLD}━━━ 系统调优 ━━━${NC}"
-    [ -f "$SYSCTL_CONF" ] && log_ok "系统参数已配置" || echo "  系统参数: ${DIM}未配置${NC}"
-    [ -f "$RPS_SERVICE" ] && log_ok "RPS 已配置" || echo "  RPS: ${DIM}未配置${NC}"
-    echo
-    
-    echo -e "${BOLD}━━━ WireGuard ━━━${NC}"
-    local role=$(detect_wg_role)
-    if [ -n "$role" ]; then
-        [ "$role" = "hub" ] && echo -e "  角色: ${CYAN}Hub (中转)${NC}" || echo -e "  角色: ${CYAN}Node (落地)${NC}"
-        
-        if [ -f "$WG_CONFIG_FILE" ]; then
-            local port=$(grep '^ListenPort' "$WG_CONFIG_FILE" 2>/dev/null | awk '{print $3}')
-            local ip=$(grep '^Address' "$WG_CONFIG_FILE" 2>/dev/null | head -1 | awk '{print $3}')
-            local peers=$(grep -c '^\[Peer\]' "$WG_CONFIG_FILE" 2>/dev/null || echo 0)
-            
-            echo -e "  端口: ${port:-无}  IP: ${ip:-无}  Peers: ${peers}"
-            
-            # 公钥
-            local priv=$(grep '^PrivateKey' "$WG_CONFIG_FILE" 2>/dev/null | head -1 | awk '{print $3}')
-            [ -n "$priv" ] && command -v wg >/dev/null 2>&1 && echo -e "  公钥: ${BOLD}$(echo "$priv" | wg pubkey 2>/dev/null)${NC}"
-            
-            # 运行状态
-            if command -v wg >/dev/null 2>&1 && wg show wg0 >/dev/null 2>&1; then
-                echo -e "  状态: ${GREEN}运行中${NC}"
-                local hs=$(wg show wg0 latest-handshakes 2>/dev/null | awk '{print $2}' | sort -rn | head -1)
-                if [ -n "$hs" ] && [ "$hs" -gt 0 ] 2>/dev/null; then
-                    local ago=$(( $(date +%s) - hs ))
-                    [ "$ago" -lt 180 ] && echo -e "  握手: ${GREEN}${ago}秒前${NC}" || echo -e "  握手: ${RED}${ago}秒前${NC}"
-                fi
-            else
-                echo -e "  状态: ${RED}未运行${NC}"
-            fi
-        fi
+    log "等待 3 秒测试与 Hub 的连通性..."
+    sleep 3
+    if ping -c 2 -W 2 "${wg_subnet}.1" >/dev/null 2>&1; then
+        ok "已 ping 通 Hub (${wg_subnet}.1)"
     else
-        echo -e "  角色: ${DIM}未配置${NC}"
+        warn "Hub ping 不通 — 检查 Hub 是否已添加本机 Peer"
     fi
-    echo
-    
-    # peers 列表
-    if [ "$role" = "hub" ] && [ -f "$WG_PEERS_FILE" ]; then
-        echo -e "${BOLD}━━━ Nodes ━━━${NC}"
-        while IFS=: read -r n p i e; do
-            [ -n "$n" ] && echo -e "  • $n: $i (端口: $e)"
-        done < "$WG_PEERS_FILE" 2>/dev/null || true
-        echo
-    fi
+
+    cat <<EOF
+
+${C_BLD}${C_GRN}========== Node 部署完成 ==========${C_RST}
+  角色:        落地机 (Node)
+  WG 地址:     ${node_addr}/24
+  Hub:         ${hub_ip}:${hub_port}
+  MTU:         ${wg_mtu}
+  本机公钥:    ${C_YEL}${pub}${C_RST}
+${C_BLD}====================================${C_RST}
+
+${C_CYN}下一步（在 Hub 上执行）：${C_RST}
+  sudo bash install.sh add-node
+  填入：
+    Node 公钥        = ${pub}
+    Node WG 地址     = ${node_addr}
+    对外监听端口     = 你想从 Hub 暴露给客户端的端口 (例: 444)
+    Node 服务实际端口= 本机 SUDOKU/代理监听的端口   (例: 443)
+EOF
 }
 
-# ============================================
-# 菜单
-# ============================================
-show_menu() {
-    while true; do
-        show_status
-        
-        echo -e "${BOLD}操作:${NC}"
-        echo "  ${CYAN}── 初始化 ──${NC}"
-        echo "  ${GREEN}1.${NC} 初始化 Hub"
-        echo "  ${GREEN}2.${NC} 初始化 Node"
-        echo "  ${CYAN}── 管理 ──${NC}"
-        echo "  ${GREEN}3.${NC} 添加 Node"
-        echo "  ${GREEN}4.${NC} 启动 WG"
-        echo "  ${GREEN}5.${NC} 停止 WG"
-        echo "  ${GREEN}6.${NC} 重启 WG"
-        echo "  ${GREEN}7.${NC} wg show"
-        echo "  ${CYAN}── 系统 ──${NC}"
-        echo "  ${GREEN}8.${NC} 系统调优"
-        echo "  ${GREEN}9.${NC} 保存 iptables"
-        echo "  ${DIM}0.${NC} 退出"
-        echo
-        read -r -p "选项 [0-9]: " choice
-        
-        case "$choice" in
-            1)
-                echo
-                read -r -p "端口 [${DEFAULT_WG_PORT}]: " p
-                WG_LISTEN_PORT="${p:-$DEFAULT_WG_PORT}"
-                read -r -p "隧道IP [${DEFAULT_TUNNEL_IP_HUB}]: " i
-                WG_TUNNEL_IP="${i:-$DEFAULT_TUNNEL_IP_HUB}"
-                init_hub; pause ;;
-            2)
-                echo
-                read -r -p "Hub地址 (IP:端口): " e
-                [ -z "$e" ] && { log_error "不能为空"; pause; continue; }
-                WG_ENDPOINT="$e"
-                read -r -p "Hub公钥: " p
-                [ -z "$p" ] && { log_error "不能为空"; pause; continue; }
-                WG_PEER_PUBKEY="$p"
-                read -r -p "本机隧道IP [${DEFAULT_TUNNEL_IP_NODE}]: " i
-                WG_TUNNEL_IP="${i:-$DEFAULT_TUNNEL_IP_NODE}"
-                init_node; pause ;;
-            3)
-                echo
-                read -r -p "Node公钥: " p
-                [ -z "$p" ] && { log_error "不能为空"; pause; continue; }
-                WG_PEER_PUBKEY="$p"
-                read -r -p "Node IP: " i
-                [ -z "$i" ] && { log_error "不能为空"; pause; continue; }
-                WG_TUNNEL_IP="$i"
-                read -r -p "名称: " n
-                NODE_NAME="$n"
-                add_node; pause ;;
-            4) wg_reload; pause ;;
-            5) (wg-quick down wg0 2>/dev/null && log_ok "已停止") || log_warn "停止失败"; pause ;;
-            6) wg_reload; pause ;;
-            7) echo; wg show wg0 2>/dev/null || log_warn "获取失败"; echo; pause ;;
-            8) optimize_system; pause ;;
-            9) save_iptables_rules; pause ;;
-            0|q) log_info "再见!"; exit 0 ;;
-            *) log_warn "无效: $choice"; pause ;;
-        esac
+# ----- 6. add-node：在 Hub 上动态加落地 --------------------------------------
+add_node() {
+    [[ -f "$WG_CONF" ]] || { err "未找到 $WG_CONF，先 install"; exit 1; }
+    local role
+    role=$(read_state ROLE || echo "")
+    if [[ "$role" != "hub" ]]; then
+        err "本机不是 Hub（角色=$role），add-node 只能在 Hub 上执行"
+        exit 1
+    fi
+
+    title "在 Hub 上添加新落地 Peer"
+
+    local node_pub node_addr ext_port int_port proto egress wg_subnet name
+    egress=$(read_state EGRESS || get_egress_iface)
+    wg_subnet=$(read_state WG_SUBNET || echo "$WG_SUBNET_DEFAULT")
+
+    read -rp "落地名称（用于备注，例: japan / lax / hk）: " name
+    [[ -z "$name" ]] && name="node"
+    read -rp "落地 公钥: " node_pub
+    [[ -z "$node_pub" ]] && { err "公钥不能为空"; exit 1; }
+    read -rp "落地 WG 地址 (例: ${wg_subnet}.3): " node_addr
+    [[ -z "$node_addr" ]] && { err "WG 地址不能为空"; exit 1; }
+    read -rp "Hub 对外监听端口（客户端连接的端口，例: 444）: " ext_port
+    [[ -z "$ext_port" ]] && { err "对外端口不能为空"; exit 1; }
+    read -rp "落地实际服务端口（落地上 SUDOKU 等监听的端口，例: 443）: " int_port
+    [[ -z "$int_port" ]] && { err "落地端口不能为空"; exit 1; }
+    read -rp "协议 [tcp/udp/both]，默认 tcp: " proto
+    proto=${proto:-tcp}
+
+    # 防重复：公钥已存在就拒绝
+    if grep -qF "PublicKey = ${node_pub}" "$WG_CONF" 2>/dev/null; then
+        err "该公钥已在配置中，跳过 Peer 追加（仍可重复运行以补加 DNAT）"
+    else
+        cat >> "$WG_CONF" <<EOF
+
+[Peer]
+# ${name}
+PublicKey  = ${node_pub}
+AllowedIPs = ${node_addr}/32
+EOF
+        ok "Peer 已写入 $WG_CONF"
+    fi
+
+    # 应用 Peer（优先热加载，不中断现有连接）
+    # wg-quick strip 在某些系统/版本不可用，改用更兼容的方式
+    local reload_ok=0
+    if systemctl is-active --quiet "wg-quick@${WG_IF}"; then
+        if wg addconf "${WG_IF}" <(grep -A3 "PublicKey  = ${node_pub}" "$WG_CONF" | \
+            grep -v '^$' | head -4) 2>/dev/null; then
+            reload_ok=1
+        elif wg syncconf "${WG_IF}" <(wg-quick strip "${WG_IF}" 2>/dev/null) 2>/dev/null; then
+            reload_ok=1
+        fi
+    fi
+    if [[ $reload_ok -eq 0 ]]; then
+        warn "热加载失败，改为 restart（会短暂断开现有连接）"
+        systemctl restart "wg-quick@${WG_IF}"
+    else
+        ok "Peer 已热加载（现有连接不受影响）"
+    fi
+
+    # ---- DNAT ----
+    local dnat_protos=()
+    case "$proto" in
+        tcp) dnat_protos=(tcp) ;;
+        udp) dnat_protos=(udp) ;;
+        both) dnat_protos=(tcp udp) ;;
+        *) err "未知协议 $proto"; exit 1 ;;
+    esac
+
+    for p in "${dnat_protos[@]}"; do
+        # 幂等：先尝试删后加
+        iptables -t nat -C PREROUTING -i "$egress" -p "$p" --dport "$ext_port" \
+            -j DNAT --to-destination "${node_addr}:${int_port}" 2>/dev/null \
+            && iptables -t nat -D PREROUTING -i "$egress" -p "$p" --dport "$ext_port" \
+                 -j DNAT --to-destination "${node_addr}:${int_port}" || true
+        iptables -t nat -A PREROUTING -i "$egress" -p "$p" --dport "$ext_port" \
+            -j DNAT --to-destination "${node_addr}:${int_port}"
+
+        iptables -C FORWARD -i "$egress" -o "${WG_IF}" -p "$p" \
+            -d "$node_addr" --dport "$int_port" -j ACCEPT 2>/dev/null || \
+        iptables -A FORWARD -i "$egress" -o "${WG_IF}" -p "$p" \
+            -d "$node_addr" --dport "$int_port" -j ACCEPT
     done
+
+    # 持久化 iptables
+    if command -v netfilter-persistent >/dev/null; then
+        netfilter-persistent save >/dev/null
+    elif command -v iptables-save >/dev/null && [[ -d /etc/iptables ]]; then
+        iptables-save > /etc/iptables/rules.v4
+    fi
+
+    # 状态记录
+    write_state "MAP_${ext_port}_${proto}" "${name}|${node_addr}|${int_port}|${node_pub}"
+
+    cat <<EOF
+
+${C_BLD}${C_GRN}========== add-node 完成 ==========${C_RST}
+  落地名称:    ${name}
+  落地 WG IP:  ${node_addr}
+  入口端口:    ${egress}:${ext_port}/${proto}
+  落地服务:    ${node_addr}:${int_port}
+${C_BLD}====================================${C_RST}
+
+  现在客户端把  ${C_YEL}server_address${C_RST}  指向：
+    Hub公网IP  端口 ${ext_port}
+  即可走  Hub → WG → ${name}  到达  SUDOKU/代理服务。
+EOF
 }
 
-# ============================================
-# 参数
-# ============================================
-usage() {
-    cat <<'EOF'
-用法: bash install.sh [命令]
+# ----- 7. 状态展示 -----------------------------------------------------------
+show_status() {
+    title "wg-relay 状态"
 
-命令:
-  (无参数)     交互式菜单
-  init-hub     初始化 Hub
-  init-node    初始化 Node
-  add-node     添加 Node
-  start/stop/restart  WG 控制
-  status       查看状态
-  optimize     系统调优
-  help         帮助
+    if [[ ! -f "$WG_CONF" ]]; then
+        warn "未安装 / $WG_CONF 不存在"
+        return
+    fi
 
-选项:
-  --port PORT      端口
-  --endpoint ADDR 对端地址
-  --pubkey KEY    公钥
-  --ip IP         隧道 IP
-  --name NAME     节点名称
-  --ext-port PORT 外部端口
-  --psk KEY       预共享密钥
+    local role
+    role=$(read_state ROLE || echo "?")
+    echo "  角色: ${role}"
+    echo "  公网 IP: $(get_public_ip || echo unknown)"
+    echo "  内核: $(uname -r)"
+    echo "  BBR: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+    echo "  ip_forward: $(sysctl -n net.ipv4.ip_forward 2>/dev/null)"
+    echo
+
+    title "WireGuard"
+    if systemctl is-active --quiet "wg-quick@${WG_IF}"; then
+        ok "wg-quick@${WG_IF} 运行中"
+    else
+        err "wg-quick@${WG_IF} 未运行"
+    fi
+    wg show "${WG_IF}" 2>/dev/null || warn "wg show 无输出"
+
+    if [[ "$role" == "hub" ]]; then
+        title "DNAT 端口映射"
+        if [[ -f "$STATE_FILE" ]]; then
+            grep '^MAP_' "$STATE_FILE" 2>/dev/null | while IFS='=' read -r k v; do
+                # MAP_444_tcp=name|10.66.0.3|443|pubkey
+                local port_proto="${k#MAP_}"
+                local ext_port="${port_proto%_*}"
+                local proto="${port_proto##*_}"
+                IFS='|' read -r name node_addr int_port _pub <<< "$v"
+                printf "  %-10s  :%s/%s  ->  %s:%s\n" "$name" "$ext_port" "$proto" "$node_addr" "$int_port"
+            done
+        fi
+        echo
+        title "iptables NAT (PREROUTING)"
+        iptables -t nat -nL PREROUTING --line-numbers | sed 's/^/  /'
+    fi
+}
+
+# ----- 8. 卸载（保留 sysctl 调优）-------------------------------------------
+do_uninstall() {
+    title "卸载 wg-relay"
+    read -rp "确定要卸载 WG 与端口映射吗？(yes/no): " ans
+    [[ "$ans" == "yes" ]] || { log "已取消"; return; }
+
+    systemctl disable --now "wg-quick@${WG_IF}" 2>/dev/null || true
+    systemctl disable --now wg-rps.service 2>/dev/null || true
+
+    # 清掉本脚本加的 NAT/FORWARD 规则
+    if [[ -f "$STATE_FILE" ]]; then
+        local egress; egress=$(read_state EGRESS || get_egress_iface)
+        # 不用管道（子 shell 中 local 无效），改用 while+重定向
+        while IFS='=' read -r k v; do
+            [[ "$k" =~ ^MAP_ ]] || continue
+            local port_proto="${k#MAP_}"
+            local ext_port="${port_proto%_*}"
+            local proto="${port_proto##*_}"
+            local _n node_addr int_port _p
+            IFS='|' read -r _n node_addr int_port _p <<< "$v"
+            iptables -t nat -D PREROUTING -i "$egress" -p "$proto" --dport "$ext_port" \
+                -j DNAT --to-destination "${node_addr}:${int_port}" 2>/dev/null || true
+            iptables -D FORWARD -i "$egress" -o "${WG_IF}" -p "$proto" \
+                -d "$node_addr" --dport "$int_port" -j ACCEPT 2>/dev/null || true
+        done < "$STATE_FILE"
+    fi
+    command -v netfilter-persistent >/dev/null && netfilter-persistent save >/dev/null || true
+
+    rm -f "$WG_CONF" "$STATE_FILE" "$RPS_SERVICE" "$RPS_SCRIPT"
+    systemctl daemon-reload
+    ok "已卸载（系统调优 ${SYSCTL_FILE} 保留，如需也清掉请手动 rm）"
+}
+
+# ----- 主入口 ---------------------------------------------------------------
+do_install() {
+    require_root
+    detect_os
+
+    # ── 检测已有配置 ──────────────────────────────────────────────────────────
+    local existing_role=""
+    existing_role=$(read_state ROLE 2>/dev/null || echo "")
+
+    if [[ -f "$WG_CONF" && -n "$existing_role" ]]; then
+        warn "检测到本机已安装（角色: ${C_BLD}${existing_role}${C_RST}${C_YEL}，配置: $WG_CONF）"
+        echo
+        echo "  ${C_BLD}请选择操作：${C_RST}"
+        echo "  1) 保留现有配置，仅重新应用系统调优 (sysctl/RPS)"
+        if [[ "$existing_role" == "hub" ]]; then
+            echo "  2) 保留现有配置，添加新落地节点 (等同于 add-node)"
+        fi
+        echo "  3) 覆盖重装（会清除现有 WG 配置，peers 需重新添加）"
+        echo "  q) 退出"
+        read -rp "输入选项: " reinstall_choice
+
+        case "$reinstall_choice" in
+            1)
+                log "仅重新应用系统调优，跳过 WG 配置"
+                apply_sysctl
+                install_packages
+                setup_rps
+                ok "系统调优已完成，WG 配置未改动"
+                return
+                ;;
+            2)
+                if [[ "$existing_role" == "hub" ]]; then
+                    apply_sysctl
+                    install_packages
+                    setup_rps
+                    add_node
+                    return
+                else
+                    err "当前角色不是 hub，无法添加节点"; exit 1
+                fi
+                ;;
+            3)
+                warn "将覆盖重装，原配置已备份"
+                # 继续往下执行完整安装流程
+                ;;
+            q|Q)
+                log "已退出，配置未改动"
+                return
+                ;;
+            *)
+                err "无效选项，已退出"; exit 1
+                ;;
+        esac
+    fi
+
+    apply_sysctl
+    install_packages
+    setup_rps
+
+    # ── 角色选择 ─────────────────────────────────────────────────────────────
+    local role
+    if [[ -n "${ROLE:-}" ]]; then
+        role="$ROLE"
+        log "使用环境变量角色: $role"
+    else
+        echo
+        echo "${C_BLD}选择本机角色：${C_RST}"
+        echo "  1) hub   — 中转机（监听端，对接 GA / 多落地）"
+        echo "  2) node  — 落地机（落地端，跑 SUDOKU/代理服务）"
+        read -rp "输入 1 或 2: " choice
+        case "$choice" in
+            1) role="hub" ;;
+            2) role="node" ;;
+            *) err "无效选择"; exit 1 ;;
+        esac
+    fi
+
+    case "$role" in
+        hub)  configure_hub ;;
+        node) configure_node ;;
+        *) err "未知角色: $role"; exit 1 ;;
+    esac
+}
+
+print_help() {
+    cat <<EOF
+${C_BLD}wg-relay v${SCRIPT_VERSION}${C_RST} — 一键 WireGuard 中转/落地
+
+用法:
+  sudo bash $0 install     交互式安装（hub 或 node）
+  sudo bash $0 add-node    Hub 上：动态新增一个落地 peer + DNAT
+  sudo bash $0 status      查看当前状态与端口映射
+  sudo bash $0 tune        仅应用 sysctl + RPS（不装 WG）
+  sudo bash $0 uninstall   卸载 WG 与映射规则
+
+环境变量:
+  ROLE=hub|node            非交互模式下指定角色
 
 示例:
-  sudo bash install.sh init-hub --port 48940
-  sudo bash install.sh init-node --endpoint 1.2.3.4:48940 --pubkey xxx
-  sudo bash install.sh add-node --pubkey xxx --ip 10.8.0.3
-  sudo bash install.sh optimize
+  # Hub 上加日本落地，对外端口 444 -> 落地的 :443
+  sudo bash $0 add-node
 EOF
-}
-
-parse_args() {
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            init-hub|init-node|add-node|start|stop|restart|status|optimize|save-iptables|help)
-                ACTION="$1"; shift ;;
-            --port) WG_LISTEN_PORT="$2"; shift 2 ;;
-            --endpoint) WG_ENDPOINT="$2"; shift 2 ;;
-            --pubkey) WG_PEER_PUBKEY="$2"; shift 2 ;;
-            --ip) WG_TUNNEL_IP="$2"; shift 2 ;;
-            --name) NODE_NAME="$2"; shift 2 ;;
-            --ext-port) EXTERNAL_PORT="$2"; shift 2 ;;
-            --psk) WG_PEER_PSK="$2"; shift 2 ;;
-            --help|-h) ACTION="help"; shift ;;
-            *) shift ;;
-        esac
-    done
-    [ -z "$ACTION" ] && ACTION="interactive"
 }
 
 main() {
-    parse_args "$@"
-    
-    case "$ACTION" in
-        help) usage; exit 0 ;;
-        status) check_root; show_status; exit 0 ;;
-    esac
-    
-    check_root
-    
-    case "$ACTION" in
-        interactive) show_menu ;;
-        init-hub) init_hub; exit 0 ;;
-        init-node) init_node; exit 0 ;;
-        add-node) add_node; exit 0 ;;
-        start) wg_reload; exit 0 ;;
-        stop) wg-quick down wg0 2>/dev/null && log_ok "已停止" || log_warn "停止失败或未运行"; exit 0 ;;
-        restart) wg_reload; exit 0 ;;
-        optimize) optimize_system; exit 0 ;;
-        save-iptables) save_iptables_rules; exit 0 ;;
-        *) log_error "未知: $ACTION"; usage; exit 1 ;;
+    case "${1:-}" in
+        install)        do_install ;;
+        add-node|peer)  require_root; add_node ;;
+        status)         show_status ;;
+        tune)           require_root; detect_os; apply_sysctl; setup_rps ;;
+        uninstall)      require_root; do_uninstall ;;
+        -h|--help|help|"") print_help ;;
+        *) err "未知命令: $1"; print_help; exit 1 ;;
     esac
 }
 
