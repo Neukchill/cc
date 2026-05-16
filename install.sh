@@ -279,9 +279,9 @@ configure_hub() {
 
     cat > "$WG_CONF" <<EOF
 [Interface]
-# Role: HUB  Subnet: ${wg_subnet}.0/24  Egress: ${egress}
+# Role: HUB  Subnet: ${wg_subnet}.0/8  Egress: ${egress}
 PrivateKey = ${priv}
-Address    = ${hub_ip}/24
+Address    = ${hub_ip}/8
 ListenPort = ${wg_port}
 MTU        = ${wg_mtu}
 
@@ -380,7 +380,7 @@ MTU        = ${wg_mtu}
 # Hub
 PublicKey           = ${hub_pub}
 Endpoint            = ${hub_ip}:${hub_port}
-AllowedIPs          = ${wg_subnet}.0/24
+AllowedIPs          = 10.0.0.0/8
 PersistentKeepalive = 25
 EOF
     chmod 600 "$WG_CONF"
